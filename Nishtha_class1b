@@ -1,0 +1,42 @@
+#to set up working repository
+getwd()
+setwb("path to your file")
+
+#to create sub folders 
+
+dir.create("raw_data")
+dir.create("raw_data")
+dir.create("clean_data")
+dir.create("scripts")
+dir.create("results")
+
+#loading data
+
+data <- read.csv(file.choose())
+
+# to Inspect the structure of the dataset using appropriate R functions
+
+str(data)
+list.files()
+head(data)
+summary(data)
+
+#to manipulate data
+data$gender <- as.factor(data$gender)
+str(data)
+data$diagnosis <- as.factor(data$diagnosi)
+str(data)
+data$smoker <- as.factor(data$smoker)
+str(data)
+
+#to create a  binary variable 
+data$smoking_binary <- ifelse(data$smoker =="Yes" , 1, 0))
+str(data)
+names(data)
+colnames(data)
+head(data)
+
+#to save clean data
+write.csv(data,"clean_data/data_clean.csv")
+
+save.image(file = "full_workspace.RData")
