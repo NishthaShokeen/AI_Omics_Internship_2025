@@ -1,0 +1,331 @@
+# -------------------------
+# 0. Install / Load packages
+# -------------------------
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# Bioconductor packages commonly used (install only if missing)
+bioc_pkgs <- c("GEOquery","affy","arrayQualityMetrics","limma","Biobase","genefilter")
+for (p in bioc_pkgs) if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p, ask = FALSE)
+
+# CRAN packages
+cran_pkgs <- c("dplyr","matrixStats")
+for (p in cran_pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p, repos = "https://cloud.r-project.org")
+
+# Load libraries
+library(GEOquery)            # getGEO
+library(Biobase)             # ExpressionSet
+library(affy)                # ReadAffy / rma (if CELs)
+library(arrayQualityMetrics) # QC
+library(limma)               # normalizeBetweenArrays
+library(genefilter)          # rowMedians helper (but we'll use matrixStats)
+library(dplyr)
+library(matrixStats)
+
+# -------------------------
+# 1. Download series matrix (ExpressionSet)
+# -------------------------
+gse_id <- "GSE97300"
+message("Downloading series matrix for ", gse_id, " ... (this may take a minute)")
+gse_list <- getGEO(gse_id, GSEMatrix = TRUE)
+
+if (length(gse_list) == 0) stop("No GSE object returned by getGEO. Check accession or internet connection.")
+# Sometimes getGEO returns a list with one ExpressionSet
+gse <- gse_list[[1]]
+message("Successfully loaded series matrix: ", annotation(gse))
+
+# Extract expression matrix, feature & phenotype data
+expr_mat_raw <- exprs(gse)       # probes × samplescat("Expression matrix dimensions (probes x samples):", dim(expr_mat_raw), "\n")
+cat("Number of phenotype columns:", ncol(pheno_data), "\n")
+feat_data <- fData(gse)          # probe annotation if present
+pheno_data <- pData(gse)         # sample metadata
+
+cat("Expression matrix dimensions (probes x samples):", dim(expr_mat_raw), "\n")
+cat("Number of phenotype columns:", ncol(pheno_data), "\n")
+
+# -------------------------
+# 2. Try to download raw supplementary files (CELs) if present
+# -------------------------
+raw_dir <- file.path(getwd(), "Raw_Data", gse_id)
+dir.create(raw_dir, recursive = TRUE, showWarnings = FALSE)
+
+sups <- getGEOSuppFiles(gse_id, makeDirectory = FALSE, baseDir = raw_dir)
+# Note: getGEOSuppFiles sometimes places files in raw_dir/<GSE>/...
+message("Supplementary files (downloaded list):")
+print(rownames(sups))
+
+# 2. Try to download raw supplementary files (CELs) if present
+# -------------------------
+raw_dir <- file.path(getwd(), "Raw_Data", gse_id)
+dir.create(raw_dir, recursive = TRUE, showWarnings = FALSE)
+
+sups <- getGEOSuppFiles(gse_id, makeDirectory = FALSE, baseDir = raw_dir)
+# Note: getGEOSuppFiles sometimes places files in raw_dir/<GSE>/...
+message("Supplementary files (downloaded list):")
+print(rownames(sups))
+
+# Identify possible tar/zip of CELs
+possible_tars <- list.files(raw_dir, pattern = "\\.tar$|\\.tar.gz$|\\.zip$", full.names = TRUE, ignore.case = TRUE)
+has_cel_archive <- length(possible_tars) > 0
+
+raw_affy_obj <- NULL
+if (has_cel_archive) {
+  message("Found archive(s). Attempting to extract CEL files and read them with ReadAffy()...")
+  for (arc in possible_tars) {
+    # attempt extract into Raw_Data/CEL_Files
+    cel_out <- file.path(raw_dir, "CEL_Files")
+    dir.create(cel_out, recursive = TRUE, showWarnings = FALSE)
+    if (grepl("\\.zip$", arc, ignore.case = TRUE)) {
+      tryCatch(unzip(arc, exdir = cel_out), error = function(e) message("unzip error: ", e))
+    } else {
+      tryCatch(untar(arc, exdir = cel_out), error = function(e) message("untar error: ", e))
+    }
+  }
+  # Try to read CELs if any .CEL or .cel.gz present
+  cel_files <- list.files(file.path(raw_dir, "CEL_Files"), pattern = "\\.CEL$|\\.cel$|\\.CEL\\.gz$|\\.cel\\.gz$", full.names = TRUE, ignore.case = TRUE)
+  if (length(cel_files) > 0) {
+    message("Found", length(cel_files), "CEL files. Reading with ReadAffy() ...")
+    # ReadAffy expects the directory with CEL files
+    tryCatch({
+      raw_affy_obj <- ReadAffy(celfile.path = file.path(raw_dir, "CEL_Files"))
+      message("Raw Affy object read: ", raw_affy_obj)
+    }, error = function(e) {
+      message("Error reading CEL files with ReadAffy(): ", e$message)
+      raw_affy_obj <<- NULL
+    })
+  } else {
+    message("No CEL files found after extraction.")
+  }
+} else {
+  message("No compressed raw archive found in ", raw_dir, ". Proceeding using series matrix only.")
+}
+
+# -------------------------
+# 3. Quality Control - BEFORE normalization
+# -------------------------
+# arrayQualityMetrics can take an ExpressionSet.
+# If raw_affy_obj available, convert it to ExpressionSet for QC; otherwise use series matrix ExpressionSet (gse).
+
+qc_input_before <- NULL
+if (!is.null(raw_affy_obj)) {
+  # convert AffyBatch -> ExpressionSet (use just intensity values, no normalization)
+  qc_input_before <- affy::rma(raw_affy_obj, normalize = FALSE) # background corrected but keep here primarily for QC
+  # Note: we will still do full rma below if needed
+  message("Using Affy-based object for pre-normalization QC.")
+} else {
+  # Use the ExpressionSet from series matrix (may be already processed)
+  qc_input_before <- gse
+  message("Using series matrix ExpressionSet for pre-normalization QC.")
+}
+
+# Create a directory for QC outputs
+qc_raw_dir <- file.path("Results", "QC_Raw_Data")
+dir.create(qc_raw_dir, recursive = TRUE, showWarnings = FALSE)
+# Run arrayQualityMetrics - wrap in tryCatch because it can be interactive/heavy
+message("Running arrayQualityMetrics for raw data. Output -> ", qc_raw_dir)
+tryCatch({
+  arrayQualityMetrics(expressionset = qc_input_before,
+                      outdir = qc_raw_dir,
+                      force = TRUE,
+                      do.logtransform = TRUE)
+}, error = function(e) {
+  message("arrayQualityMetrics failed: ", e$message)
+  message("You can still inspect boxplots/density manually below.")
+})
+
+# Quick manual QC plots (boxplot + density) for immediate inspection
+pdf(file = file.path(qc_raw_dir, "boxplot_density_raw.pdf"), width = 10, height = 6)
+par(mfrow = c(1,2))
+boxplot(exprs(qc_input_before), main = "Boxplot - raw (per array)", las = 2, cex.axis = 0.7)
+plot(density(as.numeric(exprs(qc_input_before))), main = "Combined density (raw)"); legend("topright", legend = c(), bty="n")
+dev.off()
+message("Saved quick QC plots to: ", file.path(qc_raw_dir, "boxplot_density_raw.pdf"))
+
+library(GEOquery)
+
+gse_id <- "GSE97300"
+raw_dir <- "C:/Users/Lenovo/Desktop/AI_Omics_Internship_2025/Raw_Data/GSE97300"
+
+options(download.file.method = "libcurl")
+Sys.setenv("CURL_SSL_NO_VERIFY" = "1")
+
+getGEOSuppFiles(gse_id, makeDirectory = FALSE, baseDir = raw_dir)
+# -------------------------
+# 4. Normalization
+# -------------------------
+normalized_eset <- NULL
+if (!is.null(raw_affy_obj)) {
+  # Perform RMA normalization on raw AffyBatch
+  message("Performing RMA normalization (Affymetrix CELs present).")
+  normalized_affy <- rma(raw_affy_obj)        # this returns an ExpressionSet
+  normalized_eset <- normalized_affy
+} else {
+  # Series matrix only. Determine whether log2 transform is needed and perform quantile normalization.
+  message("No raw CELs available. Performing log2 and quantile normalization (if needed) on series matrix data.")
+  expr <- expr_mat_raw
+  # If values look like high (>1000) assume not log2 - do log2 transform after adding small offset
+  qx <- as.numeric(quantile(expr, probs = c(0.01, 0.99), na.rm = TRUE))
+  if (qx[2] > 100) {
+    message("Values appear unlogged (99th percentile = ", round(qx[2],1), "), applying log2(x+1) transform.")
+    expr <- log2(expr + 1)
+  } else {
+    message("Values appear already logged (99th percentile = ", round(qx[2],1), "), skipping log transform.")
+  }
+  # Quantile normalization using limma::normalizeBetweenArrays
+  expr_norm <- normalizeBetweenArrays(expr, method = "quantile")
+  normalized_eset <- ExpressionSet(assayData = as.matrix(expr_norm))
+  # Copy phenotype / feature data if available
+  pData(normalized_eset) <- pheno_data
+  fData(normalized_eset) <- feat_data
+}
+
+# Save normalized data to file
+dir.create("Results", showWarnings = FALSE)
+saveRDS(normalized_eset, file = file.path("Results", paste0(gse_id, "_normalized_eset.rds")))
+message("Normalized ExpressionSet saved to Results/", gse_id, "_normalized_eset.rds")
+
+# QC AFTER normalization
+qc_norm_dir <- file.path("Results", "QC_Normalized_Data")
+dir.create(qc_norm_dir, recursive = TRUE, showWarnings = FALSE)
+message("Running arrayQualityMetrics for normalized data. Output -> ", qc_norm_dir)
+tryCatch({
+  arrayQualityMetrics(expressionset = normalized_eset,
+                      outdir = qc_norm_dir,
+                      force = TRUE)
+}, error = function(e) {
+  message("arrayQualityMetrics (normalized) failed: ", e$message)
+})
+
+# Quick boxplot/density after normalization
+pdf(file = file.path(qc_norm_dir, "boxplot_density_normalized.pdf"), width = 10, height = 6)
+par(mfrow = c(1,2))
+boxplot(exprs(normalized_eset), main = "Boxplot - normalized (per array)", las = 2, cex.axis = 0.7)
+plot(density(as.numeric(exprs(normalized_eset))), main = "Combined density (normalized)"); legend("topright", legend = c(), bty="n")
+dev.off()
+
+# -------------------------
+# 5. Extract normalized expression matrix
+# -------------------------
+expr_norm_mat <- exprs(normalized_eset)    # probes × samples
+cat("Normalized expression matrix dims (probes x samples):", dim(expr_norm_mat), "\n")
+
+# -------------------------
+# 6. Filtering - low-intensity / low-variance probes
+# -------------------------
+# Example: median intensity filter across samples (soft filtering)
+probe_median <- rowMedians(as.matrix(expr_norm_mat), na.rm = TRUE)
+
+# Quick histogram of probe medians
+hist(probe_median, breaks = 100, main = "Probe median intensity (normalized)", xlab = "Median intensity")
+
+# Set a threshold: dataset-specific. For logged data, typical thresholds are 3-6; adjust if needed.
+threshold <- 3.5
+cat("Filtering probes with row-median <= ", threshold, "\n")
+keep_idx <- probe_median > threshold
+filtered_mat <- expr_norm_mat[keep_idx, , drop = FALSE]
+cat("Probes before filtering:", nrow(expr_norm_mat), "\n")
+cat("Probes after filtering:", nrow(filtered_mat), "\n")
+
+# Alternative: filter by variance if desired (uncomment to use)
+# var_thresh <- 0.05
+# keep_var <- rowVars(expr_norm_mat) > var_thresh
+# filtered_mat <- expr_norm_mat[keep_idx & keep_var, ]
+
+# Save filtered expression matrix to CSV / RDS
+write.csv(filtered_mat, file = file.path("Results", paste0(gse_id, "_filtered_expression.csv")), row.names = TRUE)
+saveRDS(filtered_mat, file = file.path("Results", paste0(gse_id, "_filtered_expression.rds")))
+message("Filtered expression matrix saved to Results/")
+
+# -------------------------
+# 7. Phenotype preparation: define groups (normal vs cancer)
+# -------------------------
+# The series may use "source_name_ch1" or "characteristics_ch1" or other fields.
+print(colnames(pheno_data))
+# Try common fields
+possible_fields <- c("source_name_ch1","characteristics_ch1","title","description")
+field_found <- intersect(possible_fields, colnames(pheno_data))[1]
+
+if (is.na(field_found) || is.null(field_found)) {
+  # fallback: use the first column
+  field_found <- colnames(pheno_data)[1]
+}
+
+cat("Using phenotype field for grouping:", field_found, "\n")
+pheno_field_vals <- as.character(pheno_data[[field_found]])
+print(pheno_field_vals)
+
+# Attempt to map to normal vs cancer. We'll look for keywords (case-insensitive).
+map_to_group <- function(x) {
+  xlow <- tolower(x)
+  if (grepl("normal|adjacent|control|non-tumor|non tumor|para", xlow)) return("normal")
+  if (grepl("tumor|tumour|cancer|adenocarcinoma|cc|carcinoma", xlow)) return("cancer")
+  # fallback: return original
+  return(x)
+}
+group_labels <- sapply(pheno_field_vals, map_to_group)
+# If mapping returned original values, convert to factor levels automatically
+groups <- factor(group_labels)
+cat("Derived groups and counts:\n")
+print(table(groups))
+
+# For assignment: print number of samples per group
+cat("Number of samples (total):", ncol(filtered_mat), "\n")
+print(table(groups))
+
+# Name columns in filtered_mat with sample names
+colnames(filtered_mat) <- colnames(expr_norm_mat) # maintain original sample names
+
+# -------------------------
+# 8. Summary outputs for your assignment
+# -------------------------
+cat("\n==== ASSIGNMENT SUMMARY ====\n")
+# How many arrays flagged by arrayQualityMetrics? (There is no programmatic extractor; check the HTML files in Results/QC_Raw_Data and Results/QC_Normalized_Data)
+cat("QC reports generated at:\n -", normalizePath(qc_raw_dir), "\n -", normalizePath(qc_norm_dir), "\n")
+cat("Probes (before filtering):", nrow(expr_norm_mat), "\n")
+cat("Probes (after filtering):", nrow(filtered_mat), "\n")
+cat("Sample groups and counts:\n"); print(table(groups))
+cat("============================\n")
+
+# -------------------------
+# 9. Optional: mapping probe IDs to gene symbols / lncRNA names
+# -------------------------
+# If platform GPL is available, get platform table
+gpls <- getGEO(annotation(gse), AnnotGPL = TRUE)
+# gpls might be NULL or a GPL object; try to retrieve feature table if available
+if (!is.null(gpls)) {
+  gpl <- gpls
+  # fData from gpl
+  if (!is.null(Table(gpl))) {
+    gpl_table <- Table(gpl)
+    message("Platform table columns include: ", paste(colnames(gpl_table), collapse = ", "))
+    # Try to match probe IDs
+    # Common columns: ID, Gene Symbol, Gene title, etc - adjust based on platform
+    # We'll try to merge by 'ID' (probe id)
+    if ("ID" %in% colnames(gpl_table)) {
+      probe_info <- gpl_table
+      rownames(probe_info) <- probe_info$ID
+      # If your filtered_mat rows are probe IDs that match, you can merge
+      message("You can inspect probe_info and merge with filtered_mat by probe IDs.")
+    }
+  }
+} else {
+  message("GPL annotation object not found via getGEO(annotation). You can download GPL21827 from GEO manually if needed.")
+}
+
+# -------------------------
+# 10. Save final workspace and a small report
+# -------------------------
+save.image(file = file.path("Results", paste0(gse_id, "_preproc_workspace.RData")))
+message("Workspace saved to Results/", gse_id, "_preproc_workspace.RData")
+
+
+dim(processed_data)
+normalized_eset <- rma(raw_data)
+
+groups <- factor(pheno_data$source_name_ch1,
+                 levels = c("gastric mucosa", "gastric adenocarcinoma"),
+                 labels = c("normal", "cancer"))
+
+dim(filtered_data)
+processed_data <- as.data.frame(exprs(normalized_eset))
+row_median <- rowMedians(as.matrix(processed_data))
